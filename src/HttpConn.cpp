@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cerrno>
 #include <cstring>
+#include <sys/socket.h>
 
 HttpConn::HttpConn() : fd_(-1), isClose_(true) {}
 
@@ -16,6 +17,10 @@ void HttpConn::init(int fd) {
     isClose_ = false;
     readBuffer_.clear();
     writeBuffer_.clear();
+    
+    // 初始化状态机
+    state_ = ParseState::REQUEST_LINE;
+    headers_.clear();
 }
 
 // 关闭连接
@@ -90,27 +95,122 @@ bool HttpConn::write() {
     }
 }
 
-// 🌟 绝招 3：业务中枢 (这里先写一个超级简化的状态机模型)
+//  业务中枢 
 void HttpConn::process() {
-    // 1. 理论上这里应该调用你的 HttpParser 状态机，去解析 readBuffer_
-    std::cout << "[HttpConn] 解析请求:\n" << readBuffer_ << std::endl;
+    // 只有当状态机完整解析完一个 HTTP 请求时，才去生成响应
+    if (parseRequest()) {
+        makeResponse();
+        
+        // 响应存入写缓冲后，把状态机重置，准备迎接下一个请求（Keep-Alive 长连接支持！）
+        state_ = ParseState::REQUEST_LINE;
+        headers_.clear();
+    }
+}
 
-    // 2. 清空读缓冲 (实际项目中，如果发生半包，这里不能全清空，要根据状态机的指示来)
-    readBuffer_.clear(); 
+//  主从状态机引擎
+bool HttpConn::parseRequest() {
+    // 主循环：只要没解析完，就一直解析
+    while (state_ != ParseState::FINISH) {
+        
+        // --- 从状态机：试图从 readBuffer_ 中切出一行 (\r\n) ---
+        size_t lineEnd = readBuffer_.find("\r\n");
+        
+        if (lineEnd == std::string::npos) {
+            // 没找到 \r\n，说明数据不够（半包），立刻退出，等下次 epoll 唤醒再接着解
+            return false; 
+        }
 
-    // 3. 生成 HTTP 响应报文，存入写缓冲区
-    const char* body = "<h1>Hello from Encapsulated HttpConn!</h1>";
-    char response[512];
+        // 成功切出一行数据
+        std::string line = readBuffer_.substr(0, lineEnd);
+        // 把这一行连同 \r\n 从读缓冲区里抹掉
+        readBuffer_.erase(0, lineEnd + 2); 
+
+        // --- 主状态机：根据当前状态，处理这一行 ---
+        switch (state_) {
+            case ParseState::REQUEST_LINE: {
+                if (!parseRequestLine(line)) return false;
+                state_ = ParseState::HEADERS; // 解析成功，状态转移到 HEADERS
+                break;
+            }
+            case ParseState::HEADERS: {
+                if (line.empty()) {
+                    // 遇到空行！说明 Header 彻底结束了！
+                    std::cout << "[FSM] Headers parsed completely!\n";
+                    // 如果是 GET 请求，到空行就结束了。如果是 POST，还要去解析 BODY
+                    if (method_ == "POST") {
+                        state_ = ParseState::BODY;
+                    } else {
+                        state_ = ParseState::FINISH;
+                    }
+                } else {
+                    parseHeader(line); // 还没遇到空行，继续提取 Header
+                }
+                break;
+            }
+            case ParseState::BODY: {
+                // 这里暂时略过 POST Body 的处理，直接完成
+                state_ = ParseState::FINISH;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return true; // 走到这里说明状态是 FINISH，解析大功告成！
+}
+
+// 解析请求行 (例如: "GET /index.html HTTP/1.1")
+bool HttpConn::parseRequestLine(const std::string& line) {
+    size_t pos1 = line.find(' ');
+    size_t pos2 = line.find(' ', pos1 + 1);
+    if (pos1 == std::string::npos || pos2 == std::string::npos) {
+        return false; // 格式不对
+    }
+    method_ = line.substr(0, pos1);
+    path_ = line.substr(pos1 + 1, pos2 - pos1 - 1);
+    version_ = line.substr(pos2 + 1);
+    
+    std::cout << "[FSM] Method: " << method_ << ", Path: " << path_ << ", Version: " << version_ << std::endl;
+    return true;
+}
+
+//  解析请求头 (例如: "Host: 127.0.0.1:8080")
+void HttpConn::parseHeader(const std::string& line) {
+    size_t pos = line.find(':');
+    if (pos != std::string::npos) {
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 2); // 跳过冒号和后面的空格
+        headers_[key] = value;
+    }
+}
+
+//  根据状态机提取的 path_ 进行精准路由
+void HttpConn::makeResponse() {
+    std::string responseBody;
+    std::string statusLine;
+
+    // 精准路由判定
+    if (path_ == "/") {
+        statusLine = "HTTP/1.1 200 OK\r\n";
+        responseBody = "<h1>Welcome to Epoll Web Server!</h1><p>Status Machine works!</p>";
+    } else if (path_ == "/api") {
+        statusLine = "HTTP/1.1 200 OK\r\n";
+        // 我们可以把状态机解析出来的 User-Agent 打印到网页上！
+        responseBody = "{\"message\": \"API OK\", \"your_browser\": \"" + headers_["User-Agent"] + "\"}";
+    } else {
+        statusLine = "HTTP/1.1 404 Not Found\r\n";
+        responseBody = "<h1>404 Error: Page Not Found</h1>";
+    }
+
+    char response[1024];
     snprintf(response, sizeof(response),
-             "HTTP/1.1 200 OK\r\n"
+             "%s"
              "Content-Type: text/html\r\n"
              "Content-Length: %zu\r\n"
              "Connection: keep-alive\r\n"
              "\r\n"
-             "%s", strlen(body), body);
+             "%s", 
+             statusLine.c_str(), responseBody.size(), responseBody.c_str());
 
     writeBuffer_ = response;
-    
-    // 注意：走到这里，数据并没有真正发送出去！
-    // 它只是躺在 writeBuffer_ 里。发送的动作交给了外面的 write() 函数。
 }

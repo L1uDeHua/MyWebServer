@@ -14,7 +14,9 @@ void setNonBlocking(int fd) {
 WebServer::WebServer(int port, int threadNum) 
     : port_(port), 
       epoller_(new Epoller()), 
-      threadPool_(new ThreadPool(threadNum)) {
+      threadPool_(new ThreadPool(threadNum)),
+      timer_(new HeapTimer()),      // 初始化定时器
+      timeoutMS_(30000) {           // 设定 30 秒超时
     initSocket();
 }
 
@@ -44,19 +46,25 @@ void WebServer::start() {
     std::cout << "WebServer is starting..." << std::endl;
     // Boss 线程的终极死循环
     while (true) {
-        int eventCnt = epoller_->wait(-1);
+        int timeMS = timer_->getNextTick(); 
+        
+        // 如果 5000 毫秒内没有任何客户发数据，epoll_wait 就会按时醒来
+        int eventCnt = epoller_->wait(timeMS);
+        
         for (int i = 0; i < eventCnt; ++i) {
             int fd = epoller_->getEventFd(i);
             uint32_t events = epoller_->getEvents(i);
 
             if (fd == listenFd_) {
-                handleNewConn(); // 老板亲自接待新客人
-            } 
-            else if (events & EPOLLIN) {
-                handleRead(fd);  // 读事件，交给线程池
-            } 
-            else if (events & EPOLLOUT) {
-                handleWrite(fd); // 写事件，交给线程池
+                handleNewConn();
+            } else if (events & EPOLLIN) {
+                //  客户发来数据了！赶紧给它续命！
+                timer_->add(fd, timeoutMS_, std::bind(&WebServer::closeConn, this, fd));
+                handleRead(fd);
+            } else if (events & EPOLLOUT) {
+                //  客户能接收数据了！也续命！
+                timer_->add(fd, timeoutMS_, std::bind(&WebServer::closeConn, this, fd));
+                handleWrite(fd);
             }
         }
     }
@@ -74,6 +82,7 @@ void WebServer::handleNewConn() {
     
     // 加进 epoll，监听可读事件，必须加上 ET 和 ONESHOT！
     epoller_->addFd(clientFd, EPOLLIN | EPOLLET | EPOLLONESHOT);
+    timer_->add(clientFd, timeoutMS_, std::bind(&WebServer::closeConn, this, clientFd));
     std::cout << "[Boss] New Client Fd: " << clientFd << std::endl;
 }
 
@@ -108,4 +117,14 @@ void WebServer::handleWrite(int clientFd) {
             users_[clientFd].closeConn();
         }
     });
+}
+
+void WebServer::closeConn(int clientFd) {
+    // 只有还在哈希表里才清理，防止重复清理
+    if(users_.count(clientFd)) {
+        epoller_->delFd(clientFd);
+        users_[clientFd].closeConn();
+        users_.erase(clientFd); // 把内存彻底释放
+        std::cout << "[Boss] Timeout or Closed. Kicked out Fd: " << clientFd << std::endl;
+    }
 }

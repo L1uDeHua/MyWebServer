@@ -2,35 +2,49 @@
 #define HTTP_CONN_H
 
 #include <string>
-#include <arpa/inet.h>
+#include <unordered_map>
+
+// 🌟 主状态机的三种状态
+enum class ParseState {
+    REQUEST_LINE, // 正在解析请求行
+    HEADERS,      // 正在解析请求头
+    BODY,         // 正在解析请求体
+    FINISH        // 解析完成
+};
 
 class HttpConn {
 public:
     HttpConn();
     ~HttpConn();
 
-    // 初始化这个连接
     void init(int fd);
-    
-    // 关闭连接
     void closeConn();
 
-    // 🌟 核心接口：被线程池调用的三个方法
-    bool read();      // 一次性把内核缓冲区的数据全读进 readBuffer_
-    bool write();     // 一次性把 writeBuffer_ 的数据全写进内核缓冲区
-    void process();   // 处理业务逻辑：解析 readBuffer_ -> 生成响应存入 writeBuffer_
+    bool read();
+    bool write();
+    void process();
 
-    // 获取当前连接的 fd
     int getFd() const;
 
 private:
-    int fd_;                  // 这个连接对应的 Socket fd
-    bool isClose_;            // 标记这个连接是否已经关闭
+    // 🌟 状态机核心解析函数
+    bool parseRequest();
+    bool parseRequestLine(const std::string& line);
+    void parseHeader(const std::string& line);
+    void makeResponse(); // 专门用来生成响应
 
-    std::string readBuffer_;  // 专属读缓冲区：存浏览器发来的数据
-    std::string writeBuffer_; // 专属写缓冲区：存我们要发给浏览器的数据
+    int fd_;
+    bool isClose_;
 
-    // TODO: 这里未来可以加入你写的状态机变量，比如 CheckState checkState_;
+    std::string readBuffer_;
+    std::string writeBuffer_;
+
+    // 🌟 状态机专属变量
+    ParseState state_;                             // 当前所处的状态
+    std::string method_;                           // 请求方法 (GET, POST)
+    std::string path_;                             // 请求路径 (/test, /index.html)
+    std::string version_;                          // HTTP 版本 (HTTP/1.1)
+    std::unordered_map<std::string, std::string> headers_; // 存储所有的请求头
 };
 
 #endif // HTTP_CONN_H

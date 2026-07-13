@@ -4,6 +4,7 @@
 #include "Epoller.h"
 #include "ThreadPool.h"
 #include "HttpConn.h"
+#include "HeapTimer.h"
 #include <unordered_map>
 #include <memory>
 
@@ -19,10 +20,13 @@ private:
     void handleNewConn();          // 处理新客户端连接
     void handleRead(int clientFd); // 处理客户端发来数据
     void handleWrite(int clientFd);// 处理向客户端发送数据
+    void closeConn(int clientFd);
 
     int port_;
     int listenFd_;
+    int timeoutMS_;
     
+    std::unique_ptr<HeapTimer> timer_;       //定时器
     std::unique_ptr<Epoller> epoller_;       // 封装好的 epoll
     std::unique_ptr<ThreadPool> threadPool_; // 线程池
     std::unordered_map<int, HttpConn> users_;// fd 到 HttpConn 的映射表
